@@ -21,6 +21,7 @@ from ..pdu import Address
 from ..errors import (
     DecodingError,
     ExecutionError,
+    PropertyError,
     ServicesError,
 )
 from ..primitivedata import Unsigned, ObjectIdentifier
@@ -30,6 +31,7 @@ from ..apdu import (
     SimpleAckPDU,
     ErrorRejectAbortNack,
     SubscribeCOVRequest,
+    SubscribeCOVPropertyRequest,
     ConfirmedCOVNotificationRequest,
     UnconfirmedCOVNotificationRequest,
 )
@@ -303,7 +305,7 @@ class SubscriptionContextManager:
 
 @bacpypes_debugging
 class Subscription(DebugContents):
-    _debug_contents = (
+    _debug_contents: Tuple[str, ...] = (
         "obj_ref",
         "client_addr",
         "proc_id",
@@ -378,6 +380,67 @@ class Subscription(DebugContents):
             self.cancel_handle = loop.call_later(
                 lifetime, self.obj_ref._app.cancel_subscription, self
             )
+
+
+@bacpypes_debugging
+class PropertySubscription(Subscription):
+    _debug_contents: Tuple[str, ...] = (
+        "obj_ref",
+        "client_addr",
+        "proc_id",
+        "obj_id",
+        "confirmed",
+        "lifetime",
+        "prop_id",
+        "prop_index",
+        "covIncrement",
+    )
+
+    def __init__(
+        self,
+        obj_ref,
+        client_addr,
+        proc_id,
+        obj_id,
+        confirmed,
+        lifetime,
+        prop_id,
+        prop_index,
+        cov_inc,
+    ):
+        if _debug:
+            PropertySubscription._debug(
+                "__init__ %r %r %r %r %r %r %r %r %r",
+                obj_ref,
+                client_addr,
+                proc_id,
+                obj_id,
+                confirmed,
+                lifetime,
+                prop_id,
+                prop_index,
+                cov_inc,
+            )
+
+        # let the subscription class save the common parameters
+        Subscription.__init__(
+            self,
+            obj_ref,
+            client_addr,
+            proc_id,
+            obj_id,
+            confirmed,
+            lifetime,
+            cov_inc,
+        )
+
+        # the specific property (attribute name and optional array index)
+        self.prop_id = prop_id
+        self.prop_index = prop_index
+
+        # the value most recently provided to this subscriber, used as
+        # the baseline when applying its own COV increment
+        self.last_reported_value = None
 
 
 #
@@ -525,7 +588,10 @@ class ChangeOfValueServices:
         cov_detection.cancel_subscription(cov)
 
         # if the detection algorithm doesn't have any subscriptions, remove it
-        if not len(cov_detection.cov_subscriptions):
+        if not (
+            len(cov_detection.cov_subscriptions)
+            or len(cov_detection.cov_property_subscriptions)
+        ):
             if _debug:
                 ChangeOfValueServices._debug("    - no more subscriptions")
 
@@ -680,3 +746,163 @@ class ChangeOfValueServices:
                 ChangeOfValueServices._debug("    - send a notification")
             loop = asyncio.get_running_loop()
             loop.call_soon(cov_detection.send_cov_notifications, cov)
+
+    # -----
+
+    async def do_SubscribeCOVPropertyRequest(
+        self, apdu: SubscribeCOVPropertyRequest
+    ) -> None:
+        if _debug:
+            ChangeOfValueServices._debug(
+                "do_SubscribeCOVPropertyRequest %r", apdu
+            )
+
+        # extract the pieces
+        client_addr = apdu.pduSource
+        proc_id = apdu.subscriberProcessIdentifier
+        obj_id = apdu.monitoredObjectIdentifier
+        confirmed = apdu.issueConfirmedNotifications
+        lifetime = apdu.lifetime
+        cov_inc = apdu.covIncrement
+
+        property_reference = apdu.monitoredPropertyIdentifier
+        prop_id = property_reference.propertyIdentifier.attr
+        prop_index = property_reference.propertyArrayIndex
+        if _debug:
+            ChangeOfValueServices._debug(
+                "    - prop_id, prop_index: %r %r", prop_id, prop_index
+            )
+
+        # request is to cancel the subscription
+        cancel_subscription = (confirmed is None) and (lifetime is None)
+
+        # find the object
+        obj = self.get_object_id(obj_id)
+        if _debug:
+            ChangeOfValueServices._debug("    - object: %r", obj)
+        if not obj:
+            if cancel_subscription:
+                # always return a Result(+), the subscription may have been
+                # previously successful and the object deleted, then this
+                # cancelation would have been successful
+                await self.response(SimpleAckPDU(context=apdu))
+                return
+            else:
+                raise ExecutionError(errorClass="object", errorCode="unknownObject")
+
+        # the property must be one that is defined on the object
+        if prop_id not in obj._elements:
+            if _debug:
+                ChangeOfValueServices._debug("    - unknown property")
+            raise PropertyError(errorCode="unknownProperty")
+
+        # look for an associated class and if it's not there it's not supported
+        criteria_class = getattr(obj, "_cov_criteria", None)
+        if _debug:
+            ChangeOfValueServices._debug(
+                "    - criteria_class: %r", criteria_class
+            )
+        if not criteria_class:
+            raise ExecutionError(
+                errorClass="services", errorCode="covSubscriptionFailed"
+            )
+
+        # the property must be one of the properties that would be reported
+        # by an object-level subscription, otherwise COV is not supported
+        # for this property
+        if prop_id not in criteria_class.properties_reported:
+            if _debug:
+                ChangeOfValueServices._debug("    - not a COV property")
+            raise PropertyError(errorCode="notCovProperty")
+
+        # look for an algorithm already associated with this object
+        cov_detection = self._cov_detections.get(obj_id, None)
+
+        # if there isn't one, make one and associate it with the object
+        if not cov_detection:
+            # make one of these and bind it to the object
+            cov_detection = criteria_class(obj)
+
+            # keep track of it for other subscriptions
+            self._cov_detections[obj_id] = cov_detection
+        if _debug:
+            ChangeOfValueServices._debug("    - cov_detection: %r", cov_detection)
+
+        # can a match be found? subscriptions are distinguished by the
+        # client, subscriber process, object, and monitored property
+        cov = None
+        for property_cov in cov_detection.cov_property_subscriptions.get(
+            (prop_id, prop_index), ()
+        ):
+            all_equal = (
+                (property_cov.client_addr == client_addr)
+                and (property_cov.proc_id == proc_id)
+                and (property_cov.obj_id == obj_id)
+            )
+            if _debug:
+                ChangeOfValueServices._debug(
+                    "    - property_cov, all_equal: %r %r", property_cov, all_equal
+                )
+
+            if all_equal:
+                cov = property_cov
+                break
+        if _debug:
+            ChangeOfValueServices._debug("    - cov: %r", cov)
+
+        # if a match was found, update the subscription
+        if cov:
+            if cancel_subscription:
+                if _debug:
+                    ChangeOfValueServices._debug("    - cancel the subscription")
+                self.cancel_subscription(cov)
+            else:
+                if _debug:
+                    ChangeOfValueServices._debug("    - renew the subscription")
+                cov.renew_subscription(lifetime)
+                cov.confirmed = confirmed
+                cov.covIncrement = cov_inc
+                cov.last_reported_value = None
+        else:
+            if cancel_subscription:
+                if _debug:
+                    ChangeOfValueServices._debug(
+                        "    - cancel a subscription that doesn't exist"
+                    )
+            else:
+                if _debug:
+                    ChangeOfValueServices._debug("    - create a subscription")
+
+                # make a property subscription
+                cov = PropertySubscription(
+                    obj,
+                    client_addr,
+                    proc_id,
+                    obj_id,
+                    confirmed,
+                    lifetime,
+                    prop_id,
+                    prop_index,
+                    cov_inc,
+                )
+                if _debug:
+                    ChangeOfValueServices._debug("    - cov: %r", cov)
+
+                # add it to our subscriptions lists
+                self.add_subscription(cov)
+
+        # success
+        response = SimpleAckPDU(context=apdu)
+
+        # return the result
+        await self.response(response)
+
+        # if the subscription is not being canceled, it is new or renewed,
+        # so send it a notification when you get a chance.
+        if (not cancel_subscription) and cov:
+            if _debug:
+                ChangeOfValueServices._debug("    - send a notification")
+            loop = asyncio.get_running_loop()
+            loop.call_soon(
+                cov_detection.send_property_cov_notifications, cov
+            )
